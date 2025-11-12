@@ -49,9 +49,9 @@ float LT = 18.0;  // Low  temp threshold
 short int Light_threshold = 250; // Less => night, more => day
 
 // Host pour reporting périodique
-String target_ip   = "";
+String target_ip   = "172.20.10.2";
 int    target_port = 1880;   // Node-RED par défaut
-int    target_sp   = 0;      // période d’envoi en secondes (0 = off)
+int    target_sp   = 10;      // période d’envoi en secondes (0 = off)
 
 // Timers
 unsigned long lastSensorsMillis = 0;
