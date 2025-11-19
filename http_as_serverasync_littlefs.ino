@@ -1,192 +1,200 @@
 /*
  * Projet : ESP32 HTTP + Dashboard Node-RED
- * Basé sur les codes du TPHTTP (ESPAsyncWebServer, LittleFS, HTTPClient, ArduinoJson...)
+ * Basé sur TPHTTP (ESPAsyncWebServer, LittleFS, HTTPClient…)
  */
 
 #include <ArduinoOTA.h>
 #include "ArduinoJson.h"
-#include <HTTPClient.h>         
-#include <ArduinoJson.h> 
+#include <HTTPClient.h>
 #include <WiFi.h>
 #include "AsyncTCP.h"
 #include "ESPAsyncWebServer.h"
-#include "wifi_utils.h"      // fourni dans le TP
-#include "sensors.h"        // fourni dans le TP (get_temperature, get_light, etc.)
+#include "wifi_utils.h"
+#include "sensors.h"
 #include "OneWire.h"
 #include "DallasTemperature.h"
-#include "FS.h"
+#include <FS.h>
 #include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include "routes.h"
 
-#include "routes.h"         // on va le définir plus bas
+// Permet d'utiliser makeJSON_fromStatus() défini dans routes.cpp
+StaticJsonDocument<1000> makeJSON_fromStatus();
 
 #define USE_SERIAL Serial
 
-void setup_OTA(); // si tu as déjà un ota.ino, sinon tu peux commenter
-
 /*===== ESP GPIO configuration ==============*/
-/* ---- LED ----*/
- int LEDpin   = 19;  // LED de "cooler" par exemple
+/* ---- LED / COOLER ---- */
+int LEDpin = 19;
+
+/* ---- FIRE SENSOR ---- */
+int FIRE_PIN = 27;  // adapte si besoin
+
+/* ---- FAN PWM ---- */
+int FAN_PIN = 5;
+int fanChannel = 0;
+
 /* ---- Light ----*/
- int LightPin = A5;  // ADC1_CHANNEL_5 (GPIO 33) ou ce que tu utilises déjà
+int LightPin = A5;
+
 /* ---- Temperature ----*/
 OneWire oneWire(23);
 DallasTemperature TempSensor(&oneWire);
 
 /*====== ESP Statut =========================*/
-// Représentation interne de l’état de l’objet
-String LEDState = "off";      // "cooler"
+String LEDState = "off";
 String last_temp;
 String last_light;
 
-// Seuils de régulation
-float HT = 30.0;  // High temp threshold
-float LT = 18.0;  // Low  temp threshold
+bool fireDetected = false;   // AJOUTÉ
+int fanSpeed = 0;            // AJOUTÉ
 
-// Lumière : juste un exemple, si tu en as besoin
-short int Light_threshold = 250; // Less => night, more => day
+/*====== Séuils de régulation ==================*/
+float HT = 30.0;
+float LT = 18.0;
 
-// Host pour reporting périodique
+short int Light_threshold = 250;
+
+/*====== Reporting (Node-RED) ==================*/
 String target_ip   = "172.20.10.2";
-int    target_port = 1880;   // Node-RED par défaut
-int    target_sp   = 10;      // période d’envoi en secondes (0 = off)
+int    target_port = 1880;
+int    target_sp   = 10;
 
-// Timers
+/*====== Timers ==================*/
 unsigned long lastSensorsMillis = 0;
-unsigned long sensorsPeriodMs   = 10L * 1000; // 10 s
+unsigned long sensorsPeriodMs   = 10L * 1000;
 unsigned long lastReportMillis  = 0;
 
-// Serveur HTTP asynchrone
+/*====== Serveur HTTP =================*/
 AsyncWebServer server(80);
 
-/*================= Prototypes locaux =================*/
+/*====== Prototypes =====*/
 void update_sensors();
 void sendPeriodicReport();
 
 /*=====================================================*/
-/*                    setup()                           */
+/*                       setup()                       */
 /*=====================================================*/
 void setup() {
-  /* Serial -----------------------------*/
   USE_SERIAL.begin(9600);
-  while (!USE_SERIAL) { }
+  while (!USE_SERIAL) {}
 
   USE_SERIAL.println("\nBooting ESP32 HTTP/Async/LittleFS...");
 
-  /* WiFi ------------------------------*/
+  /* WiFi */
   String hostname = "Mon petit objet ESP32";
   wificonnect_multi(hostname);
+  wifi_printstatus(0);
 
-  if (WiFi.status() == WL_CONNECTED) {
-    USE_SERIAL.println("WiFi connected : yes !");
-    wifi_printstatus(0);
-  } else {
-    USE_SERIAL.println("WiFi connected : no !");
-  }
+  /* LittleFS */
+  LittleFS.begin();
 
-  /* LittleFS --------------------------*/
-  if (!LittleFS.begin()) {
-    USE_SERIAL.println("LittleFS mount failed !");
-  } else {
-    USE_SERIAL.println("LittleFS mount OK");
-  }
-
-  /* GPIO ------------------------------*/
+  /* GPIO */
   pinMode(LEDpin, OUTPUT);
   digitalWrite(LEDpin, LOW);
-  LEDState = "off";
 
-  /* Capteurs --------------------------*/
+  pinMode(FIRE_PIN, INPUT);  // AJOUTÉ
+
+  /* FAN PWM */
+  ledcSetup(fanChannel, 25000, 8);  // 25 kHz, 8-bit
+  ledcAttachPin(FAN_PIN, fanChannel);
+  ledcWrite(fanChannel, fanSpeed);
+
+  /* Capteurs */
   TempSensor.begin();
-  update_sensors();  // première lecture
+  update_sensors();
 
-  /* OTA (optionnel) -------------------*/
-  // setup_OTA();
-
-  /* Routes HTTP -----------------------*/
+  /* Routes HTTP */
   setup_http_routes(&server);
-
-  /* Lancement serveur HTTP -----------*/
   server.begin();
+
   USE_SERIAL.println("Async HTTP server started on port 80");
 }
 
 /*=====================================================*/
-/*                    loop()                            */
+/*                       loop()                        */
 /*=====================================================*/
 void loop() {
-  // OTA si utilisé
-  // ArduinoOTA.handle();
-
   unsigned long now = millis();
 
-  // Mise à jour des capteurs toutes sensorsPeriodMs ms (non bloquant)
   if (now - lastSensorsMillis >= sensorsPeriodMs) {
     lastSensorsMillis = now;
     update_sensors();
-    wifi_printstatus(0); // juste pour debug
   }
 
-  // Envoi périodique vers Node-RED si activé
-  if (target_sp > 0 && (now - lastReportMillis >= (unsigned long)target_sp * 1000UL)) {
+  if (target_sp > 0 &&
+      (now - lastReportMillis >= (unsigned long)target_sp * 1000UL)) {
     lastReportMillis = now;
     sendPeriodicReport();
   }
 }
 
 /*=====================================================*/
-/*         Lecture périodique des capteurs              */
+/*                     update_sensors()                */
 /*=====================================================*/
 void update_sensors() {
-  // IMPORTANT : ne pas lire les capteurs dans les callbacks async
   TempSensor.requestTemperatures();
   float t = TempSensor.getTempCByIndex(0);
-  last_temp = String(t, 1);   // 1 décimale
 
-  int l = get_light(LightPin);
-  last_light = String(l);
+  last_temp  = String(t, 1);
+  last_light = String(get_light(LightPin));
 
-  USE_SERIAL.printf("Sensors updated -> T = %s C, L = %s\n",
-                    last_temp.c_str(), last_light.c_str());
+  /* FIRE DETECTION */
+  fireDetected = digitalRead(FIRE_PIN) == HIGH;
+
+  /* AUTOMATIC FAN CONTROL */
+  if (t > HT) fanSpeed = 255;
+  else if (t < LT) fanSpeed = 0;
+
+  ledcWrite(fanChannel, fanSpeed);
+
+  USE_SERIAL.printf("Sensors updated -> T=%s C, L=%s, Fire=%d, Fan=%d\n",
+                    last_temp.c_str(),
+                    last_light.c_str(),
+                    fireDetected,
+                    fanSpeed);
 }
 
 /*=====================================================*/
-/*      Envoi périodique du JSON vers Node-RED         */
+/*      Envoi périodique du JSON COMPLET vers Node-RED */
 /*=====================================================*/
 void sendPeriodicReportTask(void *param) {
-  if (WiFi.status() == WL_CONNECTED && target_ip != "" && target_sp > 0) {
+  if (WiFi.status() == WL_CONNECTED &&
+      target_ip != "" &&
+      target_sp > 0) 
+  {
     HTTPClient http;
 
-    String url = "http://" + target_ip + ":" + String(target_port) +
-                 "/esp?mac=" + WiFi.macAddress();
+    String url = "http://" + target_ip + ":" + String(target_port)
+                 + "/esp?mac=" + WiFi.macAddress();
 
-    StaticJsonDocument<256> doc;
-    doc["temperature"] = last_temp.toFloat();
-    doc["light"] = last_light.toInt();
-    doc["cooler"] = LEDState;
+    // JSON COMPLET identique à /status.json
+    auto doc = makeJSON_fromStatus();
     String body;
     serializeJson(doc, body);
 
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
+
     int code = http.POST(body);
     Serial.printf("HTTP POST done, code = %d\n", code);
+
     http.end();
   }
-  vTaskDelete(NULL); // Supprime la tâche une fois terminée
+
+  vTaskDelete(NULL);
 }
 
 void sendPeriodicReport() {
-  // Crée une tâche séparée pour envoyer le rapport sans bloquer le serveur
   xTaskCreatePinnedToCore(
-      sendPeriodicReportTask,  // fonction de la tâche
-      "SendReportTask",        // nom
-      8192,                    // taille de pile
-      NULL,                    // paramètre
-      1,                       // priorité
-      NULL,                    // handle
-      1                        // cœur CPU (0 ou 1)
+      sendPeriodicReportTask,
+      "SendReportTask",
+      8192,
+      NULL,
+      1,
+      NULL,
+      1
   );
 }

@@ -17,6 +17,66 @@ extern int    target_port;
 extern int    target_sp;
 
 extern const int LEDpin;
+extern short int Light_threshold;
+
+extern bool fireDetected;
+extern int fanSpeed;
+
+// Construction d'un JSON complet "à la regul"
+StaticJsonDocument<1000> makeJSON_fromStatus() {
+  StaticJsonDocument<1000> doc;
+
+  // ---------- Status section ----------
+  JsonObject status = doc.createNestedObject("status");
+  status["temperature"]  = last_temp.toFloat();
+  status["light"]        = last_light.toInt();
+  status["coolerState"]  = (LEDState == "on");
+  status["heaterState"]  = false;       // tu n'as pas de heater ici -> false/N/A
+  status["fireDetected"] = fireDetected;  // AJOUTÉ
+  status["fanSpeed"]     = fanSpeed;      // AJOUTÉ       // pas de ventilateur PWM -> 0
+
+  // ---------- Sensors section ----------
+  JsonObject sensors = doc.createNestedObject("sensors");
+  sensors["temperature"]      = last_temp.toFloat();
+  sensors["light"]            = last_light.toInt();
+  sensors["light_threshold"]  = Light_threshold;
+  sensors["fireDetected"]     = fireDetected;
+
+  // ---------- Regul section ----------
+  JsonObject regul = doc.createNestedObject("regul");
+  regul["lt"] = LT;    // Low temp threshold (18.0 par défaut)
+  regul["ht"] = HT;    // High temp threshold (30.0 par défaut)
+  regul["fanSpeed"] = fanSpeed; 
+  // ---------- Info section ----------
+  JsonObject info = doc.createNestedObject("info");
+  info["ident"] = "ESP32 HTTP";       // identifiant logique de l'objet
+  info["user"]  = "Ibra";               // comme dans ton exemple regul
+  info["loc"]   = "ESP32 Lab HTTP";   // même valeur que le placeholder WHERE
+
+  // ---------- Location section ----------
+  JsonObject location = doc.createNestedObject("location");
+  location["room"]    = "512";            // comme dans regul.h (exemple)
+  location["address"] = "Jean Médecin";   // comme dans ton makeJSON de regul
+  // Si tu veux aller plus loin :
+  // location["lat"]  = 43.7;
+  // location["lon"]  = 7.26;
+
+  // ---------- Net section ----------
+  JsonObject net = doc.createNestedObject("net");
+  net["uptime"] = millis() / 1000;     // en secondes
+  net["ssid"]   = WiFi.SSID();
+  net["mac"]    = WiFi.macAddress();
+  net["ip"]     = WiFi.localIP().toString();
+
+  // ---------- Reporthost section ----------
+  JsonObject reporthost = doc.createNestedObject("reporthost");
+  reporthost["target_ip"]   = target_ip;
+  reporthost["target_port"] = target_port;
+  reporthost["sp"]          = target_sp;   // période d’envoi en secondes
+
+  return doc;
+}
+
 
 /*=====================================================*/
 /*  Remplacement des PLACEHOLDERS dans index.html      */
@@ -84,7 +144,14 @@ void setup_http_routes(AsyncWebServer* server) {
     Serial.println("Root route requested");
     request->send(LittleFS, "/index.html", String(), false, processor);
   });
-
+  // ------------------ GET /status.json --------------------
+  // Retourne un JSON complet avec toutes les infos (comme regul)
+  server->on("/status.json", HTTP_GET, [](AsyncWebServerRequest* request) {
+    auto doc = makeJSON_fromStatus();
+    String out;
+    serializeJson(doc, out);
+    request->send(200, "application/json", out);
+  });
   /*------------------ Routes pour JS Fetch -----------*/
   // GET /temperature -> texte brut
   server->on("/temperature", HTTP_GET, [](AsyncWebServerRequest* request) {
